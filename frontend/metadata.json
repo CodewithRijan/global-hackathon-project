@@ -1,0 +1,7 @@
+{
+  "name": "GalliPark - Kathmandu's Micro-Parking Marketplace",
+  "description": "A high-performance React application for finding, booking, and managing two-wheeler parking spots in Kathmandu's narrow gallis. Features a map-based explorer, secure booking flow, and digital entry tokens.",
+  "requestFramePermissions": [
+    "geolocation"
+  ]
+}
