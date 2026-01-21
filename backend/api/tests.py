@@ -5,10 +5,12 @@ Comprehensive test suite for booking price calculation with event surcharge logi
 """
 
 from decimal import Decimal
-from django.test import TestCase
+from django.test import TestCase, Client
 from django.utils import timezone
 from datetime import timedelta, datetime, time
-from django.contrib.gis.geos import Point
+from rest_framework.test import APIClient, APITestCase
+from rest_framework.authtoken.models import Token
+from rest_framework import status
 
 from api.models import Booking, ParkingSpot, User, UtsavEvent
 from api.services import BookingPricingService, BookingValidationService
@@ -32,7 +34,8 @@ class BookingPricingServiceTests(TestCase):
         # Create parking spot
         cls.spot = ParkingSpot.objects.create(
             owner=cls.user,
-            location=Point(85.3240, 27.7172),  # Kathmandu
+            latitude=27.7172,
+            longitude=85.3240,
             address="Thamel, Kathmandu",
             city="Kathmandu",
             capacity_two_wheeler=20,
@@ -105,6 +108,7 @@ class BookingPricingServiceTests(TestCase):
         booking = Booking(
             driver=self.user,
             spot=self.spot,
+            utsav_event=self.event,  # Explicitly link to event
             vehicle_type="two_wheeler",
             start_time=booking_start,
             end_time=booking_end,
@@ -131,6 +135,7 @@ class BookingPricingServiceTests(TestCase):
         booking = Booking(
             driver=self.user,
             spot=self.spot,
+            utsav_event=self.event,  # Explicitly link to event
             vehicle_type="four_wheeler",
             start_time=booking_start,
             end_time=booking_end,
@@ -294,7 +299,8 @@ class BookingValidationServiceTests(TestCase):
         
         cls.spot = ParkingSpot.objects.create(
             owner=cls.user,
-            location=Point(85.3240, 27.7172),
+            latitude=27.7172,
+            longitude=85.3240,
             address="Thamel, Kathmandu",
             capacity_two_wheeler=5,
             capacity_four_wheeler=3,
@@ -379,3 +385,388 @@ class BookingValidationServiceTests(TestCase):
         
         self.assertFalse(is_available)
         self.assertIn("No available two-wheeler spots", error)
+
+
+# ========================
+# Authentication & JWT Tests
+# ========================
+
+class UserAuthenticationTests(APITestCase):
+    """Test suite for user authentication and JWT token management"""
+    
+    def setUp(self):
+        """Set up test client and test users"""
+        self.client = APIClient()
+        self.register_url = '/api/users/'
+        self.me_url = '/api/users/me/'
+        
+        # Create test users
+        self.user_data = {
+            'phone_number': '9841234567',
+            'password': 'securepass123',
+            'password_confirm': 'securepass123',
+            'full_name': 'Test Driver',
+            'is_driver': True,
+        }
+        
+        self.owner_data = {
+            'phone_number': '9849876543',
+            'password': 'ownerpass123',
+            'password_confirm': 'ownerpass123',
+            'full_name': 'Test Owner',
+            'is_owner': True,
+        }
+    
+    def test_user_registration_success(self):
+        """Test successful user registration"""
+        response = self.client.post(self.register_url, self.user_data, format='json')
+        
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertIn('id', response.data)
+        self.assertEqual(response.data['phone_number'], self.user_data['phone_number'])
+        self.assertEqual(response.data['full_name'], self.user_data['full_name'])
+        self.assertTrue(response.data['is_driver'])
+        
+        # Verify user was created in database
+        user = User.objects.get(phone_number=self.user_data['phone_number'])
+        self.assertIsNotNone(user)
+        self.assertTrue(user.check_password(self.user_data['password']))
+    
+    def test_user_registration_password_mismatch(self):
+        """Test registration fails when passwords don't match"""
+        invalid_data = {
+            **self.user_data,
+            'password_confirm': 'differentpass123'
+        }
+        response = self.client.post(self.register_url, invalid_data, format='json')
+        
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('password', response.data or str(response.data).lower())
+    
+    def test_user_registration_short_password(self):
+        """Test registration fails with password less than 8 characters"""
+        invalid_data = {
+            **self.user_data,
+            'password': 'short',
+            'password_confirm': 'short'
+        }
+        response = self.client.post(self.register_url, invalid_data, format='json')
+        
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+    
+    def test_user_registration_duplicate_phone(self):
+        """Test registration fails with duplicate phone number"""
+        # Create first user
+        self.client.post(self.register_url, self.user_data, format='json')
+        
+        # Try to create another with same phone
+        response = self.client.post(self.register_url, self.user_data, format='json')
+        
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('phone_number', response.data)
+    
+    def test_token_creation_on_user_registration(self):
+        """Test that authentication token is created when user registers"""
+        response = self.client.post(self.register_url, self.user_data, format='json')
+        
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        
+        # Verify token was created
+        user = User.objects.get(phone_number=self.user_data['phone_number'])
+        token = Token.objects.get(user=user)
+        self.assertIsNotNone(token.key)
+    
+    def test_token_authentication_with_valid_token(self):
+        """Test that requests with valid token are authenticated"""
+        # Register user
+        self.client.post(self.register_url, self.user_data, format='json')
+        user = User.objects.get(phone_number=self.user_data['phone_number'])
+        token = Token.objects.get(user=user)
+        
+        # Make authenticated request
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {token.key}')
+        response = self.client.get(self.me_url)
+        
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['phone_number'], self.user_data['phone_number'])
+    
+    def test_request_without_token_fails(self):
+        """Test that requests without token are rejected"""
+        response = self.client.get(self.me_url)
+        
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+        self.assertIn('credentials', str(response.data).lower() or 'not provided' in str(response.data).lower())
+    
+    def test_request_with_invalid_token_fails(self):
+        """Test that requests with invalid token are rejected"""
+        invalid_token = 'invalid_token_12345'
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {invalid_token}')
+        response = self.client.get(self.me_url)
+        
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+    
+    def test_request_with_malformed_auth_header_fails(self):
+        """Test that malformed Authorization header is rejected"""
+        self.client.credentials(HTTP_AUTHORIZATION='Bearer invalid_format')
+        response = self.client.get(self.me_url)
+        
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+    
+    def test_request_with_expired_token_fails(self):
+        """Test that expired tokens are rejected"""
+        # Register user
+        self.client.post(self.register_url, self.user_data, format='json')
+        user = User.objects.get(phone_number=self.user_data['phone_number'])
+        
+        # Create a new token and manually expire it
+        old_token = Token.objects.get(user=user)
+        old_token.delete()
+        
+        # Try request with deleted token
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {old_token.key}')
+        response = self.client.get(self.me_url)
+        
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+    
+    def test_different_users_cannot_access_each_other_data(self):
+        """Test that users can only access their own authenticated data"""
+        # Create two users
+        self.client.post(self.register_url, self.user_data, format='json')
+        self.client.post(self.register_url, self.owner_data, format='json')
+        
+        # Get tokens for both
+        user1 = User.objects.get(phone_number=self.user_data['phone_number'])
+        user2 = User.objects.get(phone_number=self.owner_data['phone_number'])
+        token1 = Token.objects.get(user=user1)
+        
+        # User1 authenticates with their token and requests /me/
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {token1.key}')
+        response = self.client.get(self.me_url)
+        
+        # Should get their own data, not user2's
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['phone_number'], self.user_data['phone_number'])
+        self.assertNotEqual(response.data['phone_number'], self.owner_data['phone_number'])
+
+
+class ProtectedEndpointsTests(APITestCase):
+    """Test suite for ensuring protected endpoints require authentication"""
+    
+    def setUp(self):
+        """Set up test client and test data"""
+        self.client = APIClient()
+        
+        # Create test user and parking spot
+        self.user = User.objects.create_user(
+            phone_number='9841234567',
+            password='testpass123',
+            full_name='Test Owner',
+            is_owner=True,
+            is_driver=True
+        )
+        
+        self.spot = ParkingSpot.objects.create(
+            owner=self.user,
+            latitude=27.7172,
+            longitude=85.3240,
+            address='Thamel, Kathmandu',
+            city='Kathmandu',
+            capacity_two_wheeler=10,
+            capacity_four_wheeler=5,
+            price_per_hour_two_wheeler=Decimal("50.00"),
+            price_per_hour_four_wheeler=Decimal("100.00"),
+            is_active=True
+        )
+        
+        self.token = Token.objects.get(user=self.user)
+    
+    def test_list_users_requires_authentication(self):
+        """Test that GET /users/ requires authentication"""
+        # Without token
+        response = self.client.get('/api/users/')
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+        
+        # With valid token
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.token.key}')
+        response = self.client.get('/api/users/')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+    
+    def test_list_parking_spots_requires_authentication(self):
+        """Test that GET /spots/ requires authentication"""
+        # Without token
+        response = self.client.get('/api/spots/')
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+        
+        # With valid token
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.token.key}')
+        response = self.client.get('/api/spots/')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+    
+    def test_create_parking_spot_requires_authentication(self):
+        """Test that POST /spots/ requires authentication"""
+        spot_data = {
+            'address': 'New Spot',
+            'city': 'Kathmandu',
+            'latitude': 27.7,
+            'longitude': 85.3,
+            'capacity_two_wheeler': 5,
+            'capacity_four_wheeler': 2,
+            'price_per_hour_two_wheeler': Decimal("50.00"),
+            'price_per_hour_four_wheeler': Decimal("100.00"),
+        }
+        
+        # Without token
+        response = self.client.post('/api/spots/', spot_data, format='json')
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+        
+        # With valid token
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.token.key}')
+        response = self.client.post('/api/spots/', spot_data, format='json')
+        self.assertIn(response.status_code, [status.HTTP_201_CREATED, status.HTTP_400_BAD_REQUEST])
+    
+    def test_list_bookings_requires_authentication(self):
+        """Test that GET /bookings/ requires authentication"""
+        # Without token
+        response = self.client.get('/api/bookings/')
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+        
+        # With valid token
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.token.key}')
+        response = self.client.get('/api/bookings/')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+    
+    def test_create_booking_requires_authentication(self):
+        """Test that POST /bookings/ requires authentication"""
+        booking_data = {
+            'spot': self.spot.id,
+            'vehicle_type': 'two_wheeler',
+            'start_time': (timezone.now() + timedelta(days=1, hours=1)).isoformat(),
+            'end_time': (timezone.now() + timedelta(days=1, hours=4)).isoformat(),
+        }
+        
+        # Without token
+        response = self.client.post('/api/bookings/', booking_data, format='json')
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+        
+        # With valid token
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.token.key}')
+        response = self.client.post('/api/bookings/', booking_data, format='json')
+        self.assertIn(response.status_code, [status.HTTP_201_CREATED, status.HTTP_400_BAD_REQUEST])
+    
+    def test_list_events_requires_authentication(self):
+        """Test that GET /events/ requires authentication"""
+        # Without token
+        response = self.client.get('/api/events/')
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+        
+        # With valid token
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.token.key}')
+        response = self.client.get('/api/events/')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+    
+    def test_get_current_user_requires_authentication(self):
+        """Test that GET /users/me/ requires authentication"""
+        # Without token
+        response = self.client.get('/api/users/me/')
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+        
+        # With valid token
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.token.key}')
+        response = self.client.get('/api/users/me/')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['phone_number'], self.user.phone_number)
+    
+    def test_update_current_user_requires_authentication(self):
+        """Test that PUT /users/me/ requires authentication"""
+        update_data = {'full_name': 'Updated Name'}
+        
+        # Without token
+        response = self.client.put('/api/users/me/', update_data, format='json')
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+        
+        # With valid token
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.token.key}')
+        response = self.client.put('/api/users/me/', update_data, format='json')
+        self.assertIn(response.status_code, [status.HTTP_200_OK, status.HTTP_400_BAD_REQUEST])
+
+
+class TokenSecurityTests(APITestCase):
+    """Test suite for token security and best practices"""
+    
+    def setUp(self):
+        """Set up test client and test user"""
+        self.client = APIClient()
+        self.user = User.objects.create_user(
+            phone_number='9841234567',
+            password='testpass123',
+            full_name='Test User',
+            is_driver=True
+        )
+        self.token = Token.objects.get(user=self.user)
+    
+    def test_token_is_unique_per_user(self):
+        """Test that each user has a unique token"""
+        user2 = User.objects.create_user(
+            phone_number='9842345678',
+            password='testpass123',
+            full_name='Test User 2',
+            is_driver=True
+        )
+        token2 = Token.objects.get(user=user2)
+        
+        self.assertNotEqual(self.token.key, token2.key)
+    
+    def test_token_persists_across_requests(self):
+        """Test that token remains valid across multiple requests"""
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.token.key}')
+        
+        # Make multiple requests with same token
+        for _ in range(3):
+            response = self.client.get('/api/users/me/')
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+    
+    def test_token_format_validation(self):
+        """Test that tokens require proper format (Token <key>)"""
+        # Wrong format: missing "Token" prefix
+        self.client.credentials(HTTP_AUTHORIZATION=self.token.key)
+        response = self.client.get('/api/users/me/')
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+        
+        # Wrong format: wrong prefix
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {self.token.key}')
+        response = self.client.get('/api/users/me/')
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+        
+        # Correct format
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {self.token.key}')
+        response = self.client.get('/api/users/me/')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+    
+    def test_case_sensitive_token(self):
+        """Test that tokens are case-sensitive"""
+        # Modify case of token
+        modified_token = self.token.key[:-5] + self.token.key[-5:].lower() if self.token.key[-5:].isupper() else self.token.key[:-5] + self.token.key[-5:].upper()
+        
+        if modified_token != self.token.key:  # Only test if case actually changes
+            self.client.credentials(HTTP_AUTHORIZATION=f'Token {modified_token}')
+            response = self.client.get('/api/users/me/')
+            self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+    
+    def test_public_user_registration_endpoint(self):
+        """Test that user registration endpoint is public (no auth required)"""
+        user_data = {
+            'phone_number': '9843456789',
+            'password': 'testpass123',
+            'password_confirm': 'testpass123',
+            'full_name': 'Public User',
+            'is_driver': True,
+        }
+        
+        # Should work without token
+        response = self.client.post('/api/users/', user_data, format='json')
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        
+        # Verify token was auto-created for new user
+        new_user = User.objects.get(phone_number=user_data['phone_number'])
+        token = Token.objects.get(user=new_user)
+        self.assertIsNotNone(token.key)

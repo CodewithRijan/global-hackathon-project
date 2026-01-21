@@ -27,7 +27,7 @@ dist-ssr
 __pycache__/
 *.pyc
 .env
-venv/
+.venv/
 
 # Django
 db.sqlite3
